@@ -1,0 +1,15 @@
+{
+  "name": "premium-3d-bakery",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A luxury 3D bakery experience with Razorpay integration",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.0.0",
+    "express": "^4.21.2",
+    "razorpay": "^2.9.6"
+  }
+}
