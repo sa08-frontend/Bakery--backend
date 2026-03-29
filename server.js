@@ -1,218 +1,169 @@
 import express from 'express';
-import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
 
 dotenv.config();
 
-// Validate environment variables
-const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID?.trim();
-const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET?.trim();
-
-if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
-  console.error('❌ Missing required environment variables:');
-  console.error('   - RAZORPAY_KEY_ID:', RAZORPAY_KEY_ID ? '✅ Set' : '❌ Missing');
-  console.error('   - RAZORPAY_KEY_SECRET:', RAZORPAY_KEY_SECRET ? '✅ Set' : '❌ Missing');
-  console.error('Please check your .env file or Railway environment variables');
-  process.exit(1);
-}
-
-console.log('✅ Environment variables loaded successfully');
-console.log('🔑 Razorpay Key ID:', RAZORPAY_KEY_ID.substring(0, 10) + '...');
-
-const razorpay = new Razorpay({
-  key_id: RAZORPAY_KEY_ID,
-  key_secret: RAZORPAY_KEY_SECRET,
-});
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-// CORS configuration - Allow all origins for development, restrict in production
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
+app.use(express.json());
+app.use(express.static(__dirname));
 
-    // Allow localhost for development
-    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
-      return callback(null, true);
-    }
-
-    // Allow Railway deployment
-    if (origin.includes('railway.app')) {
-      return callback(null, true);
-    }
-
-    // Allow all origins in development
-    if (process.env.NODE_ENV !== 'production') {
-      return callback(null, true);
-    }
-
-    // In production, you might want to restrict origins
-    callback(null, true);
+// NEW: Multi-business Razorpay key configs
+const BUSINESS_RAZORPAY_CONFIG = {
+  bakery: {
+    keyId: process.env.RAZORPAY_KEY_ID?.trim(),
+    keySecret: process.env.RAZORPAY_KEY_SECRET?.trim(),
   },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  fashion: {
+    keyId: process.env.RAZORPAY_KEY_ID1?.trim(),
+    keySecret: process.env.RAZORPAY_KEY_SECRET1?.trim(),
+  },
 };
 
-app.use(cors(corsOptions));
-app.use(express.json({ limit: '10mb' }));
+// NEW: Supported business types
+const ALLOWED_BUSINESS_TYPES = Object.keys(BUSINESS_RAZORPAY_CONFIG);
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
-  });
-});
+// NEW: Normalize businessType and default to bakery
+function normalizeBusiness(businessType) {
+  if (!businessType || typeof businessType !== 'string' || !businessType.trim()) {
+    return 'bakery';
+  }
+  return businessType.trim().toLowerCase();
+}
 
-// Razorpay configuration endpoint
+// NEW: Validate businessType
+function validateBusiness(businessType) {
+  return ALLOWED_BUSINESS_TYPES.includes(businessType);
+}
+
+// NEW: Get business config, throw if invalid
+function getBusinessConfig(businessType) {
+  const normalized = normalizeBusiness(businessType);
+  if (!validateBusiness(normalized)) {
+    throw new Error(`Invalid business type: ${businessType}`);
+  }
+  const config = BUSINESS_RAZORPAY_CONFIG[normalized];
+  if (!config || !config.keyId || !config.keySecret) {
+    throw new Error(`Razorpay keys not found for business type: ${normalized}`);
+  }
+  return { businessType: normalized, ...config };
+}
+
+// NEW: Create Razorpay instance dynamically per business
+function getRazorpayInstance(businessType) {
+  const { keyId, keySecret } = getBusinessConfig(businessType);
+  return new Razorpay({ key_id: keyId, key_secret: keySecret });
+}
+
+// NEW: /api/config returns business-specific key_id only
 app.get('/api/config', (req, res) => {
-  console.log('📡 Config request from:', req.ip);
   try {
-    res.json({
-      razorpayKeyId: RAZORPAY_KEY_ID,
-      success: true
-    });
+    const businessType = normalizeBusiness(req.query.businessType);
+    if (!validateBusiness(businessType)) {
+      return res.status(400).json({ error: 'Invalid businessType' });
+    }
+
+    const { keyId } = getBusinessConfig(businessType);
+    return res.json({ razorpayKeyId: keyId, businessType });
   } catch (error) {
-    console.error('❌ Config endpoint error:', error);
-    res.status(500).json({
-      error: 'Configuration error',
-      success: false
-    });
+    console.error('Config Error:', error.message);
+    return res.status(500).json({ error: 'Failed to get Razorpay config' });
   }
 });
 
-// Create Razorpay order endpoint
 app.post('/api/create-order', async (req, res) => {
-  console.log('💳 Order creation request from:', req.ip);
+  const { amount, currency = 'INR', businessType: rawBusinessType } = req.body;
+  const businessType = normalizeBusiness(rawBusinessType);
+
+  console.log('create-order businessType:', businessType); // NEW logging
+
+  if (!validateBusiness(businessType)) {
+    return res.status(400).json({ error: 'Invalid businessType' });
+  }
+
+  if (!amount || typeof amount !== 'number' || amount <= 0) {
+    return res.status(400).json({ error: 'Invalid amount' });
+  }
 
   try {
-    const { amount, currency = 'INR' } = req.body;
+    const razorpay = getRazorpayInstance(businessType);
+    const order = await razorpay.orders.create({
+      amount: Math.round(amount * 100),
+      currency,
+      receipt: `${businessType}_${Date.now()}`, // UPDATED
+    });
 
-    // Validate amount
-    if (!amount || typeof amount !== 'number' || amount <= 0 || amount > 100000) {
-      console.error('❌ Invalid amount:', amount);
-      return res.status(400).json({
-        error: 'Invalid amount. Must be between 1 and 100,000 INR',
-        success: false
-      });
-    }
-
-    console.log('📊 Creating order for amount:', amount, currency);
-
-    const options = {
-      amount: Math.round(amount * 100), // Convert to paisa
-      currency: currency.toUpperCase(),
-      receipt: `receipt_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
-    };
-
-    const order = await razorpay.orders.create(options);
-
-    console.log('✅ Order created successfully:', order.id);
-
-    res.json({
+    return res.json({
       ...order,
-      success: true
+      businessType,
+      razorpayKeyId: BUSINESS_RAZORPAY_CONFIG[businessType].keyId, // NEW: send key_id only
     });
-
   } catch (error) {
-    console.error('❌ Order creation error:', error);
-
-    // Handle specific Razorpay errors
-    if (error.error) {
-      return res.status(400).json({
-        error: error.error.description || 'Razorpay order creation failed',
-        success: false
-      });
-    }
-
-    res.status(500).json({
-      error: 'Internal server error during order creation',
-      success: false
-    });
+    console.error('create-order Error:', error);
+    return res.status(500).json({ error: 'Failed to create order' });
   }
 });
 
-// Verify payment endpoint
 app.post('/api/verify-payment', (req, res) => {
-  console.log('🔐 Payment verification request from:', req.ip);
+  const {
+    razorpay_order_id,
+    razorpay_payment_id,
+    razorpay_signature,
+    businessType: rawBusinessType,
+  } = req.body;
+
+  const businessType = normalizeBusiness(rawBusinessType);
+  console.log('verify-payment businessType:', businessType); // NEW logging
+
+  if (!validateBusiness(businessType)) {
+    return res.status(400).json({ error: 'Invalid businessType' });
+  }
+
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ error: 'Missing payment verification data' });
+  }
 
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const { keySecret } = getBusinessConfig(businessType);
 
-    // Validate required fields
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      console.error('❌ Missing verification data:', {
-        order_id: !!razorpay_order_id,
-        payment_id: !!razorpay_payment_id,
-        signature: !!razorpay_signature
-      });
-      return res.status(400).json({
-        success: false,
-        message: 'Missing payment verification data'
-      });
-    }
-
-    console.log('🔍 Verifying payment:', razorpay_payment_id);
-
-    // Create expected signature
     const sign = `${razorpay_order_id}|${razorpay_payment_id}`;
-    const expectedSign = crypto
-      .createHmac('sha256', RAZORPAY_KEY_SECRET)
+    const expectedSignature = crypto
+      .createHmac('sha256', keySecret)
       .update(sign)
       .digest('hex');
 
-    // Verify signature
-    if (razorpay_signature === expectedSign) {
-      console.log('✅ Payment verified successfully:', razorpay_payment_id);
-      res.json({
-        success: true,
-        message: 'Payment verified successfully'
-      });
-    } else {
-      console.error('❌ Invalid signature for payment:', razorpay_payment_id);
-      res.status(400).json({
-        success: false,
-        message: 'Payment verification failed - invalid signature'
-      });
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ success: false, message: 'Invalid signature', businessType });
     }
 
+    return res.json({ success: true, message: 'Payment verified successfully', businessType });
   } catch (error) {
-    console.error('❌ Payment verification error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error during verification'
-    });
+    console.error('verify-payment Error:', error);
+    return res.status(500).json({ error: 'Failed to verify payment' });
   }
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('💥 Global error handler:', error);
-  res.status(500).json({
-    error: 'Internal server error',
-    success: false
-  });
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 404 handler
-app.use('*', (req, res) => {
-  console.log('❓ 404 - Route not found:', req.method, req.originalUrl);
-  res.status(404).json({
-    error: 'API endpoint not found',
-    success: false
-  });
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Server started successfully!');
-  console.log(`📍 Running on: http://localhost:${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔑 Razorpay: ${RAZORPAY_KEY_ID ? 'Configured' : 'Not configured'}`);
-  console.log('📡 Ready to accept requests...');
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is busy. Set PORT env var or free the port.`);
+    process.exit(1);
+  }
+  console.error('Server startup error:', err);
+  process.exit(1);
 });
